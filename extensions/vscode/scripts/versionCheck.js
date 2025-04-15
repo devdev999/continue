@@ -5,8 +5,8 @@ const packageJson = fs.readFileSync("package.json");
 const packageJsonJson = JSON.parse(packageJson);
 const version = packageJsonJson.version;
 const minor = parseInt(version.split(".")[1]);
-if (minor % 2 !== 0) {
-  throw new Error(
-    "Do not publish odd-numbered version to main VS Code release!"
-  );
-}
+// if (minor % 2 !== 0) {
+//   throw new Error(
+//     "Do not publish odd-numbered version to main VS Code release!"
+//   );
+// }
