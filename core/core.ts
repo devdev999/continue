@@ -4,7 +4,7 @@ import { v4 as uuidv4 } from "uuid";
 
 import { CompletionProvider } from "./autocomplete/CompletionProvider";
 import { ConfigHandler } from "./config/ConfigHandler";
-import { SYSTEM_PROMPT_DOT_FILE } from "./config/getSystemPromptDotFile";
+import { SYSTEM_PROMPT_DOT_FILE } from "./config/getWorkspaceContinueRuleDotFiles";
 import { addModel, deleteModel } from "./config/util";
 import CodebaseContextProvider from "./context/providers/CodebaseContextProvider";
 import CurrentFileContextProvider from "./context/providers/CurrentFileContextProvider";
@@ -30,6 +30,7 @@ import { getSymbolsForManyFiles } from "./util/treeSitter";
 import { TTS } from "./util/tts";
 
 import {
+  ContextItemWithId,
   DiffLine,
   IdeSettings,
   ModelDescription,
@@ -46,6 +47,7 @@ import {
   setupLocalConfig,
   setupQuickstartConfig,
 } from "./config/onboarding";
+import { createNewWorkspaceBlockFile } from "./config/workspace/workspaceBlocks";
 import { MCPManagerSingleton } from "./context/mcp";
 import { streamDiffLines } from "./edit/streamDiffLines";
 import { shouldIgnore } from "./indexing/shouldIgnore";
@@ -61,23 +63,29 @@ async function* streamDiffLinesGenerator(
   msg: Message<ToCoreProtocol["streamDiffLines"][0]>,
 ): AsyncGenerator<DiffLine> {
   const data = msg.data;
-  const llm = (await configHandler.loadConfig()).config?.selectedModelByRole
-    .chat;
+
+  const { config } = await configHandler.loadConfig();
+  if (!config) {
+    throw new Error("Failed to load config");
+  }
+
+  const llm = config.selectedModelByRole.chat;
 
   if (!llm) {
     throw new Error("No chat model selected");
   }
 
-  for await (const diffLine of streamDiffLines(
-    data.prefix,
-    data.highlighted,
-    data.suffix,
+  for await (const diffLine of streamDiffLines({
+    highlighted: data.highlighted,
+    prefix: data.prefix,
+    suffix: data.suffix,
     llm,
-    data.input,
-    data.language,
-    false,
-    undefined,
-  )) {
+    rules: config.rules,
+    input: data.input,
+    language: data.language,
+    onlyOneInsertion: false,
+    overridePrompt: undefined,
+  })) {
     if (abortedMessageIds.has(msg.messageId)) {
       abortedMessageIds.delete(msg.messageId);
       break;
@@ -164,8 +172,6 @@ export class Core {
           this.configHandler.currentProfile?.profileDescription.id || null,
         organizations: this.configHandler.getSerializedOrgs(),
         selectedOrgId: this.configHandler.currentOrg.id,
-        usingContinueForTeams: (await ideSettingsPromise)
-          .enableControlServerBeta,
       });
 
       // update additional submenu context providers registered via VSCode API
@@ -321,6 +327,11 @@ export class Core {
       await this.configHandler.reloadConfig();
     });
 
+    on("config/addLocalWorkspaceBlock", async (msg) => {
+      await createNewWorkspaceBlockFile(this.ide, msg.data.blockType);
+      await this.configHandler.reloadConfig();
+    });
+
     on("config/openProfile", async (msg) => {
       await this.configHandler.openConfigProfile(msg.data.profileId);
     });
@@ -416,8 +427,6 @@ export class Core {
           this.configHandler.currentProfile?.profileDescription.id ?? null,
         organizations: this.configHandler.getSerializedOrgs(),
         selectedOrgId: this.configHandler.currentOrg.id,
-        usingContinueForTeams: (await ideSettingsPromise)
-          .enableControlServerBeta,
       };
     });
 
@@ -496,9 +505,9 @@ export class Core {
       streamDiffLinesGenerator(this.configHandler, this.abortedMessageIds, msg),
     );
 
-    on("completeOnboarding", this.handleCompleteOnboarding);
+    on("completeOnboarding", this.handleCompleteOnboarding.bind(this));
 
-    on("addAutocompleteModel", this.handleAddAutocompleteModel);
+    on("addAutocompleteModel", this.handleAddAutocompleteModel.bind(this));
 
     on("stats/getTokensPerDay", async (msg) => {
       const rows = await DevDataSqliteDb.getTokensPerDay();
@@ -539,7 +548,7 @@ export class Core {
     });
 
     // File changes - TODO - remove remaining logic for these from IDEs where possible
-    on("files/changed", this.handleFilesChanged);
+    on("files/changed", this.handleFilesChanged.bind(this));
     const refreshIfNotIgnored = async (uris: string[]) => {
       const toRefresh: string[] = [];
       for (const uri of uris) {
@@ -694,27 +703,31 @@ export class Core {
     });
 
     on("isItemTooBig", async ({ data: { item, selectedModelTitle } }) => {
-      const { config } = await this.configHandler.loadConfig();
-
-      if (!config) {
-        return false;
-      }
-
-      const llm = (await this.configHandler.loadConfig()).config
-        ?.selectedModelByRole.chat;
-
-      if (!llm) {
-        throw new Error("No chat model selected");
-      }
-
-      const tokens = countTokens(item.content);
-
-      if (tokens > llm.contextLength - llm.completionOptions!.maxTokens!) {
-        return true;
-      }
-
-      return false;
+      return this.isItemTooBig(item);
     });
+  }
+
+  private async isItemTooBig(item: ContextItemWithId) {
+    const { config } = await this.configHandler.loadConfig();
+
+    if (!config) {
+      return false;
+    }
+
+    const llm = (await this.configHandler.loadConfig()).config
+      ?.selectedModelByRole.chat;
+
+    if (!llm) {
+      throw new Error("No chat model selected");
+    }
+
+    const tokens = countTokens(item.content);
+
+    if (tokens > llm.contextLength - llm.completionOptions!.maxTokens!) {
+      return true;
+    }
+
+    return false;
   }
 
   private handleAddAutocompleteModel(
